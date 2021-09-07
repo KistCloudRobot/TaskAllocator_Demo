@@ -1,5 +1,8 @@
+from arbi_agent.model.generalized_list import GeneralizedList
+
 import deps.matching as matching
 import numpy as np
+from threading import Thread, Condition
 
 from arbi_agent.agent.arbi_agent import ArbiAgent
 from arbi_agent.configuration import BrokerType
@@ -13,42 +16,59 @@ superLargeCost = 99999999
 robot_path_delim = ':'
 robot_robot_delim = ';'
 path_path_delim = '-'
-arbiNavManager = "agent://www.arbi.com/navManager"
-arbiMAPF = "agent://www.arbi.com/MAPF"
-arbiMapManager = "agent://www.arbi.com/MapManagerAgent"
-arbiThis = "agent://www.arbi.com/TA"
+arbiNavManager = "agent://www.arbi.com/Local/NavigationController"
+arbiTaskManager = "agent://www.arbi.com/Local/TaskManager"
+arbiContextManager = "agent://www.arbi.com/Local/ContextManager"
+arbiMAPF = "agent://www.arbi.com/Local/MultiAgentPathFinder"
+arbiMapManager = "agent://www.arbi.com/Local/MapManager"
+arbiThis = "agent://www.arbi.com/Local/TaskAllocator"
 
 robotMap = {"lift": ["AMR_LIFT1", "AMR_LIFT2"], "tow": ["AMR_TOW1", "AMR_TOW2"]}
 
 
 class aAgent(ArbiAgent):
-    def __init__(self, agent_name, broker_url="tcp://127.0.0.1:61616"):
+    def __init__(self, agent_name, broker_url="tcp://172.16.165.204:61316"):
         super().__init__()
         self.broker_url = broker_url
         self.agent_name = agent_name
-        # self.agent_url = agent_url
+        self.lock = Condition()
+        self.response = None
 
     def on_data(self, sender: str, data: str):
         print(self.agent_url + "\t-> receive data : " + data)
+        self.set_response(data)
 
     def on_request(self, sender: str, request: str) -> str:
         print(self.agent_url + "\t-> receive request : " + request)
-        # return "(request ok)"
-        return handleRequest(request)
+        Thread(target=handleRequest, args=(request,), daemon=True).start()
+        return "(ok)"
 
-    """
-    def on_notify(self, content):
-        gl_notify = GLFactory.new_gl_from_gl_string(content)
-    """
+    def on_notify(self, sender: str, notification: str):
+        print(sender + "\t-> notification : " + notification)
 
     def on_query(self, sender: str, query: str) -> str:
         print(self.agent_url + "\t-> receive query : " + query)
-        # print(query)
-        return "(query ok)"
+        return "(ok)"
 
     def execute(self, broker_type=2):
         arbi_agent_excutor.execute(self.broker_url, self.agent_name, self, broker_type)
         print(self.agent_name + " ready")
+        self.on_request("agent://www.arbi.com/Local/TaskAllocator",
+                        "(TaskAllocation \"StoringCarrier\" (goal (metadata \"goal001\") \"palletTransported\" "
+                        "(argument \"rack001\" \"station1\" \"station18\")))")
+
+    def set_response(self, response):
+        with self.lock:
+            self.response = response
+            self.lock.notifyAll()
+
+    def get_response(self):
+        with self.lock:
+            while self.response is None:
+                self.lock.wait()
+            res = self.response
+            self.response = None
+            return res
 
 
 class robotPlan:
@@ -57,83 +77,125 @@ class robotPlan:
         self.start = start
         self.goal = goal
 
+    def __str__(self):
+        result = "{"
+        result += "\"name\" : \"" + self.name + "\" "
+        result += "\"start\" : " + str(self.start) + " "
+        result += "\"goal\" : " + str(self.goal)
+        return result
+
+
+def handleRequest(msg_gl):
+    # (TaskAllocation $role (goal (metadata $goalID) $goalName (argument $arg1 $arg2 ...)))
+    # keep all the other info in str, take goals out (picking)
+    # figure out all applicable robot id from somewhere. Currently predefined
+    # request robot avilability from map manager and remove unavailable robot, then do planning
+
+    gl = GLFactory.new_gl_from_gl_string(msg_gl)
+    request_name = gl.get_name()
+
+    if request_name == 'TaskAllocation':
+        goalID, robotPlanSet, goals = parseTMreq(gl)
+        # assumeing for test
+        # robotPlan(robot_id,current_vertex(in str))
+        # for test
+        # robots = (robotPlan("agent1","219"),robotPlan("agent2","222"));
+        if len(robotPlanSet) == 0:
+            # no robot is available. return no allocation here
+            arbiAgent.send(arbiTaskManager, "(AgentRecommanded " + "\"failed\" \"" + goalID + "\")")
+        robots = robotPlanSet
+        # fill cost matrix
+        # n by m matrix. n = n of robots (rows), m = number of goals(cols)
+        # cost_mat = np.random.rand(nRobots, nRobots*numWays)*10
+        allocRobotPlans = allocationCore(robots, goals)
+        print("here")
+        print(goalID)
+        for i in range(len(robotPlanSet)):
+            print(robotPlanSet[i])
+        print(goals)
+        # final Multi Agent plan Request
+        arbiAgent.send(arbiTaskManager, generate_TM_response(allocRobotPlans, goalID))
+        # return finalResult_gl
+        # toss it to other ARBI Agent
+        # arbiAgent.send(arbiNavManager, finalResult)
+    else:
+        pic.printC("Unknown Request GL Name " + request_name, 'fail')
+        return "(fail)"
+
+
+def handleData(msg_gl):
+    pass
+
 
 def glEx2str(glExpression):
     gl_str = str(glExpression)
-    if (gl_str[0] == '\"'):
+    if gl_str[0] == '\"':
         return gl_str[1:-1]
     else:
         return gl_str
 
 
 def str2Glstr(str):
-    return ("\"" + str + "\"")
+    return "\"" + str + "\""
 
 
-def parseTMreq(gl):
-    role = glEx2str(gl.get_expression(0))
-    if (role == "StoringCarrier" or role == "UnstoringLargeCarrier"):  # LIFT
+def parseTMreq(gl: GeneralizedList):
+    role = gl.get_expression(0).as_value().string_value()
+    corr_robots = None
+    if role == "StoringCarrier" or role == "UnstoringLargeCarrier":  # LIFT
         corr_robots = robotMap['lift']
-    elif (role == "UnstoringSmallCarrier"):
+    elif role == "UnstoringSmallCarrier":
         corr_robots = robotMap['tow']
     else:
         pic.printC("Unknown Role: " + role, 'fail')
         # todo: handle exception
 
+    goals = list()
+    goalID = None
     # 3 expressions in goal gl
-    gl_goal = gl.get_expression(1)
-    gl_goal_gl = GLFactory.new_gl_from_gl_string(str(gl_goal))
-    if (gl_goal_gl.get_name() == "goal"):
+    gl_goal = gl.get_expression(1).as_generalized_list()
+    if gl_goal.get_name() == "goal":
         # fist element = (metadata $goalID)
-        gl_meta_gl = GLFactory.new_gl_from_gl_string(str(gl_goal_gl.get_expression(0)))
-        goalID = glEx2str(gl_meta_gl.get_expression(0))
+        goalID = gl_goal.get_expression(0).as_generalized_list().get_expression(0).as_value().string_value()
         # second element = $goalName
-        goalName = glEx2str(gl_goal_gl.get_expression(1))
+        goalName = gl_goal.get_expression(1).as_value().string_value()
         # third element = (argument $arg1 $arg2 $arg3)
-        goalArgs_str = str(gl_goal_gl.get_expression(2))
-        goalArgs = goalArgs_str[1:-1].split(' ')
-        # remove quotation marks
-        for i in range(len(goalArgs)):
-            goalArgs[i] = goalArgs[i][1:-1]
-        # remove gl name
-        goalArgs.pop(0)
-        # remove "station" string
-        for ind in range(1, len(goalArgs)):
-            arg_sp = goalArgs[ind].split('station')
-            if (len(arg_sp) == 2):
-                goalArgs[ind] = arg_sp[1]
-            else:
-                pic.printC("Goal Arg Does Not Contain \"station\"", 'fail')
+        goalArgs = gl_goal.get_expression(2).as_generalized_list()
+        # start vertex
+        queryString = "(StationVertex \"" + goalArgs.get_expression(1).as_value().string_value() + "\" $vertex)"
+        queryResult = arbiAgent.query(arbiContextManager, queryString)
+        resultGL = GLFactory.new_gl_from_gl_string(queryResult)
+        startVertex = resultGL.get_expression(1).as_value().int_value()
+        goals.append(startVertex)
+        # goal vertex
+        queryString = "(StationVertex \"" + goalArgs.get_expression(2).as_value().string_value() + "\" $vertex)"
+        queryResult = arbiAgent.query(arbiContextManager, queryString)
+        resultGL = GLFactory.new_gl_from_gl_string(queryResult)
+        goalVertex = resultGL.get_expression(1).as_value().int_value()
+        goals.append(goalVertex)
 
-    # for test
-    # goals = ("15","1")
-    goals = []
-    for g in range(1, len(goalArgs)):
-        if (len(goalArgs[g]) > 0):
-            goals.append(goalArgs[g])
-
-    robotPlanSet = []
+    robotPlanSet = list()
     for r in corr_robots:
         # get vertex and availability of each robot from map manager
         res = arbiAgent.query(arbiMapManager, "(RobotSpecInfo \"" + r + "\")")
         # (RobotSpecInfo (RobotInfo $robot_id (vertex_id $v_id1 $v_id2) $load $goal), …)
         res_gl = GLFactory.new_gl_from_gl_string(res)
         # (RobotInfo $robot_id (vertex_id $v_id1 $v_id2) $load $goal)
-        res_sub_gl = GLFactory.new_gl_from_gl_string(str(res_gl.get_expression(0)))
-        if (glEx2str(res_sub_gl.get_expression(0)) == r):
+        res_sub_gl = res_gl.get_expression(0).as_generalized_list()
+        if res_sub_gl.get_expression(0).as_value().string_value() == r:
             # choose the first neighboring vertex as the start point
-            v = glEx2str(GLFactory.new_gl_from_gl_string(str(res_sub_gl.get_expression(1))).get_expression(0))
+            v = res_sub_gl.get_expression(1).as_generalized_list().get_expression(0).as_value().int_value()
             # unload = 0, load = 1
-            load = str(res_sub_gl.get_expression(2))
+            load = res_sub_gl.get_expression(2).as_value().int_value()
             # not currently in use
-            cur_goal = str(res_sub_gl.get_expression(3))
+            cur_goal = res_sub_gl.get_expression(3).as_value().string_value()
             # do not add to robot list if robot is loaded
-            if (load == '0'):
+            if load == 0:
                 robotPlanSet.append(robotPlan(r, v))
-
         else:
             pic.printC("Robot ID not Matched", 'fail')
-    return corr_robots, goalID, goalName, goalArgs, robotPlanSet, goals
+
+    return goalID, robotPlanSet, goals
 
 
 def allocationCore(robots, goals):
@@ -148,7 +210,7 @@ def allocationCore(robots, goals):
     c_rows, c_cols = cost_mat.shape
     for i in range(c_rows):
         for j in range(c_cols):
-            if (cost_mat[i, j] > (superLargeCost - 1)):
+            if cost_mat[i, j] > (superLargeCost - 1):
                 allocMat[i, j] = int(0)
 
     # print("***RESULT (numWays = %d)***\n" %numWays)
@@ -164,7 +226,7 @@ def allocationCore(robots, goals):
     allocRobotPlans = []
     for row in range(len(robots)):
         for col in range(len(goals)):
-            if (allocMat[row][col] == 1):
+            if allocMat[row][col] == 1:
                 robots[row].goal = goals[col]
                 allocRobotPlans.append(robots[row])
 
@@ -186,47 +248,12 @@ def generate_TM_response(allocRobotPlans, goalID):
 
     # generate returning gl string
     # currently assuming there is only one task allocation each time
-    out_str = "(agentRecommanded"
+    out_str = "(AgentRecommanded"
     for pair in out_id_goal_pair_list:
-        out_str += (" " + str2Glstr(pair[0]) + " " + goalID)
+        out_str += " " + str2Glstr(pair[0]) + " \"" + goalID + "\""
     out_str += ")"
 
     return out_str
-
-
-def handleRequest(msg_gl):
-    # (TaskAllocation $role (goal (metadata $goalID) $goalName (argument $arg1 $arg2 ...)))
-    # keep all the other info in str, take goals out (picking)
-    # figure out all applicable robot id from somewhere. Currently predefined
-    # request robot avilability from map manager and remove unavailable robot, then do planning
-    corr_robots = []
-    goalID = ""  # keep and return as it is
-    goalName = ""  # keep and return as it is
-    goalArgs = []  # this stores target
-    gl = GLFactory.new_gl_from_gl_string(msg_gl)
-    gl_name = gl.get_name()
-    if (gl_name == 'taskAllocation'):
-        corr_robots, goalID, goalName, goalArgs, robotPlanSet, goals = parseTMreq(gl)
-        # assumeing for test
-        # robotPlan(robot_id,current_vertex(in str))
-        # for test
-        # robots = (robotPlan("agent1","219"),robotPlan("agent2","222"));
-        if (len(robotPlanSet) == 0):
-            # no robot is available. return no allocation here
-            return ("(agentRecommanded " + "\"failed\" " + str2Glstr(goalID) + ")")
-        robots = robotPlanSet
-        # fill cost matrix
-        # n by m matrix. n = n of robots (rows), m = number of goals(cols)
-        # cost_mat = np.random.rand(nRobots, nRobots*numWays)*10
-        allocRobotPlans = allocationCore(robots, goals)
-        # final Multi Agent plan Request
-        return generate_TM_response(allocRobotPlans, goalID)
-        # return finalResult_gl
-        # toss it to other ARBI Agent
-        # arbiAgent.send(arbiNavManager, finalResult)
-    else:
-        pic.printC("Unknown Request GL Name " + gl_name, 'fail')
-        return
 
 
 def msg2arbi_req(msg, header="MultiRobotPath", pathHeader="RobotPath"):
@@ -234,7 +261,7 @@ def msg2arbi_req(msg, header="MultiRobotPath", pathHeader="RobotPath"):
     # (MultiRobotPath (RobotPath $robot_id $cur_vertex $goal_id), …)
 
     out_msg = "(" + header + " "
-    planList = []
+    planList = list()
     msgList = msg.split(robot_robot_delim)
     for r in msgList:
         # name1,start1,goal1
@@ -253,7 +280,7 @@ def arbi2msg_res(arbi_msg, header="MultiRobotPath", pathHeader="RobotPath", sing
     # name1,start1,goal1;name2,start2,goal2, ...
     gl = GLFactory.new_gl_from_gl_string(arbi_msg)
     robotSet = []
-    if (gl.get_name() == header):
+    if gl.get_name() == header:
         for r in range(gl.get_expression_size()):
             # (RobotPath "agent1" (path 219 220 221 222 223 224 225 15))
             rp = str(gl.get_expression(r))
@@ -288,17 +315,19 @@ def responsToDict(res):
 def planMultiAgentReqest(robotPlans, arbi):
     msgByRobot = []
     for r in robotPlans:
-        if (len(r.goal) > 0):
-            singleMsg = (r.name + robot_path_delim + r.start + robot_path_delim + r.goal)
+        if type(r.goal) == int:
+            singleMsg = (r.name + robot_path_delim + str(r.start) + robot_path_delim + str(r.goal))
             msgByRobot.append(singleMsg)
+        else:
+            print("type error?")
     reqMsg = robot_robot_delim.join(msgByRobot)
 
     # convert to arbi msg
     arbiMsg = msg2arbi_req(reqMsg)
 
     reqStartTime = time.time()
-    # res = arbi.request(arbiMAPF,reqMsg)
     res = arbi.request(arbiMAPF, arbiMsg)
+    res = arbi.get_response()
     reqEndTime = time.time()
     pic.printC("Request took " + str(reqEndTime - reqStartTime) + " seconds", 'warning')
 
@@ -324,14 +353,14 @@ def generateCostMatrix(robotPlans, goals, arbi):
             # reqEndTime = time.time()
             # print("Request took " + str(reqEndTime - reqStartTime) + " seconds")
             # expect to have result for only one robot
-            planResultDict = {}
-            if (len(pathMsg) > 0):
+            planResultDict = dict()
+            if len(pathMsg) > 0:
                 planResultDict = responsToDict(pathMsg)
             # fill cost matrix
             # if robot name is matched
-            if (r.name in planResultDict):
+            if r.name in planResultDict:
                 # if plan was a success
-                if (planResultDict[r.name][0] != 'failed'):
+                if planResultDict[r.name][0] != 'failed':
                     serializedCosts.append(len(planResultDict[r.name]))
                 else:
                     # path plan failed. apply super large cost
@@ -380,5 +409,5 @@ if __name__ == "__main__":
     arbiAgent = aAgent(arbiThis)
     arbiAgent.execute()
 
-    while (1):
+    while True:
         time.sleep(0.01)
