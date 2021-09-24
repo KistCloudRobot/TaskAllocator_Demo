@@ -1,6 +1,7 @@
 from arbi_agent.model.generalized_list import GeneralizedList
 
 import deps.matching as matching
+import socket
 import numpy as np
 from threading import Thread, Condition
 
@@ -27,7 +28,7 @@ robotMap = {"lift": ["AMR_LIFT1", "AMR_LIFT2"], "tow": ["AMR_TOW1", "AMR_TOW2"]}
 
 
 class aAgent(ArbiAgent):
-    def __init__(self, agent_name, broker_url="tcp://172.16.165.204:61316"):
+    def __init__(self, agent_name, broker_url="tcp://172.16.165.204:8000"):
         super().__init__()
         self.broker_url = broker_url
         self.agent_name = agent_name
@@ -36,12 +37,13 @@ class aAgent(ArbiAgent):
 
     def on_data(self, sender: str, data: str):
         print(self.agent_url + "\t-> receive data : " + data)
-        self.set_response(data)
 
     def on_request(self, sender: str, request: str) -> str:
         print(self.agent_url + "\t-> receive request : " + request)
-        Thread(target=handleRequest, args=(request,), daemon=True).start()
-        return "(ok)"
+        time.sleep(0.05)
+        result = handleRequest(request)
+        print("result :", result)
+        return result
 
     def on_notify(self, sender: str, notification: str):
         print(sender + "\t-> notification : " + notification)
@@ -53,22 +55,6 @@ class aAgent(ArbiAgent):
     def execute(self, broker_type=2):
         arbi_agent_excutor.execute(self.broker_url, self.agent_name, self, broker_type)
         print(self.agent_name + " ready")
-        self.on_request("agent://www.arbi.com/Local/TaskAllocator",
-                        "(TaskAllocation \"StoringCarrier\" (goal (metadata \"goal001\") \"palletTransported\" "
-                        "(argument \"rack001\" \"station1\" \"station18\")))")
-
-    def set_response(self, response):
-        with self.lock:
-            self.response = response
-            self.lock.notifyAll()
-
-    def get_response(self):
-        with self.lock:
-            while self.response is None:
-                self.lock.wait()
-            res = self.response
-            self.response = None
-            return res
 
 
 class robotPlan:
@@ -95,26 +81,28 @@ def handleRequest(msg_gl):
     request_name = gl.get_name()
 
     if request_name == 'TaskAllocation':
+        print("before parse TM request")
         goalID, robotPlanSet, goals = parseTMreq(gl)
+        print("after parse TM request")
         # assumeing for test
         # robotPlan(robot_id,current_vertex(in str))
         # for test
         # robots = (robotPlan("agent1","219"),robotPlan("agent2","222"));
+        print("before check plan correct")
         if len(robotPlanSet) == 0:
             # no robot is available. return no allocation here
+            time.sleep(0.05)
             arbiAgent.send(arbiTaskManager, "(AgentRecommanded " + "\"failed\" \"" + goalID + "\")")
+        print("after check plan correct")
         robots = robotPlanSet
         # fill cost matrix
         # n by m matrix. n = n of robots (rows), m = number of goals(cols)
         # cost_mat = np.random.rand(nRobots, nRobots*numWays)*10
+        print("before allocate")
         allocRobotPlans = allocationCore(robots, goals)
-        print("here")
-        print(goalID)
-        for i in range(len(robotPlanSet)):
-            print(robotPlanSet[i])
-        print(goals)
+        print("after allocate")
         # final Multi Agent plan Request
-        arbiAgent.send(arbiTaskManager, generate_TM_response(allocRobotPlans, goalID))
+        return generate_TM_response(allocRobotPlans, goalID)
         # return finalResult_gl
         # toss it to other ARBI Agent
         # arbiAgent.send(arbiNavManager, finalResult)
@@ -140,21 +128,32 @@ def str2Glstr(str):
 
 
 def parseTMreq(gl: GeneralizedList):
+    print(1)
     role = gl.get_expression(0).as_value().string_value()
+    print(2)
     corr_robots = None
+    print(3)
     if role == "StoringCarrier" or role == "UnstoringLargeCarrier":  # LIFT
+        print(4)
         corr_robots = robotMap['lift']
     elif role == "UnstoringSmallCarrier":
+        print(5)
         corr_robots = robotMap['tow']
     else:
+        print(6)
         pic.printC("Unknown Role: " + role, 'fail')
         # todo: handle exception
+    print(7)
 
     goals = list()
     goalID = None
     # 3 expressions in goal gl
+
+    print(8)
     gl_goal = gl.get_expression(1).as_generalized_list()
+    print(9)
     if gl_goal.get_name() == "goal":
+        print(10)
         # fist element = (metadata $goalID)
         goalID = gl_goal.get_expression(0).as_generalized_list().get_expression(0).as_value().string_value()
         # second element = $goalName
@@ -163,12 +162,14 @@ def parseTMreq(gl: GeneralizedList):
         goalArgs = gl_goal.get_expression(2).as_generalized_list()
         # start vertex
         queryString = "(StationVertex \"" + goalArgs.get_expression(1).as_value().string_value() + "\" $vertex)"
+        time.sleep(0.05)
         queryResult = arbiAgent.query(arbiContextManager, queryString)
         resultGL = GLFactory.new_gl_from_gl_string(queryResult)
         startVertex = resultGL.get_expression(1).as_value().int_value()
         goals.append(startVertex)
         # goal vertex
         queryString = "(StationVertex \"" + goalArgs.get_expression(2).as_value().string_value() + "\" $vertex)"
+        time.sleep(0.05)
         queryResult = arbiAgent.query(arbiContextManager, queryString)
         resultGL = GLFactory.new_gl_from_gl_string(queryResult)
         goalVertex = resultGL.get_expression(1).as_value().int_value()
@@ -176,23 +177,34 @@ def parseTMreq(gl: GeneralizedList):
 
     robotPlanSet = list()
     for r in corr_robots:
+        print(11)
         # get vertex and availability of each robot from map manager
+        time.sleep(0.05)
         res = arbiAgent.query(arbiMapManager, "(RobotSpecInfo \"" + r + "\")")
+        print(12)
         # (RobotSpecInfo (RobotInfo $robot_id (vertex_id $v_id1 $v_id2) $load $goal), …)
         res_gl = GLFactory.new_gl_from_gl_string(res)
+        print(13)
         # (RobotInfo $robot_id (vertex_id $v_id1 $v_id2) $load $goal)
         res_sub_gl = res_gl.get_expression(0).as_generalized_list()
+        print(14)
         if res_sub_gl.get_expression(0).as_value().string_value() == r:
             # choose the first neighboring vertex as the start point
+            print(15)
             v = res_sub_gl.get_expression(1).as_generalized_list().get_expression(0).as_value().int_value()
+            print(16)
             # unload = 0, load = 1
             load = res_sub_gl.get_expression(2).as_value().int_value()
+            print(17)
             # not currently in use
             cur_goal = res_sub_gl.get_expression(3).as_value().string_value()
+            print(18)
             # do not add to robot list if robot is loaded
             if load == 0:
+                print(19)
                 robotPlanSet.append(robotPlan(r, v))
         else:
+            print(20)
             pic.printC("Robot ID not Matched", 'fail')
 
     return goalID, robotPlanSet, goals
@@ -244,7 +256,10 @@ def generate_TM_response(allocRobotPlans, goalID):
         robot_sp = robot.split(robot_path_delim)
         robot_id_out = robot_sp[0]
         goal_vertex = robot_sp[1].split(path_path_delim)[-1]
-        out_id_goal_pair_list.append((robot_id_out, goal_vertex))
+        # TODO get first result that means from start point to rack point
+        if "LIFT2" in robot_id_out:
+            out_id_goal_pair_list.append((robot_id_out, goal_vertex))
+            break
 
     # generate returning gl string
     # currently assuming there is only one task allocation each time
@@ -326,8 +341,8 @@ def planMultiAgentReqest(robotPlans, arbi):
     arbiMsg = msg2arbi_req(reqMsg)
 
     reqStartTime = time.time()
+    time.sleep(0.05)
     res = arbi.request(arbiMAPF, arbiMsg)
-    res = arbi.get_response()
     reqEndTime = time.time()
     pic.printC("Request took " + str(reqEndTime - reqStartTime) + " seconds", 'warning')
 
@@ -406,7 +421,9 @@ def makeSqMat(mat):
 if __name__ == "__main__":
     # Create and start an ARBI Agent
     global arbiAgent
-    arbiAgent = aAgent(arbiThis)
+    broker_url = "tcp://" + str(socket.gethostbyname(socket.gethostname())) + ":61316"
+    arbiAgent = aAgent(agent_name=arbiThis,
+                       broker_url=broker_url)
     arbiAgent.execute()
 
     while True:
