@@ -1,9 +1,9 @@
 from arbi_agent.model.generalized_list import GeneralizedList
 
 import deps.matching as matching
-import socket
 import numpy as np
 from threading import Thread, Condition
+import os
 
 from arbi_agent.agent.arbi_agent import ArbiAgent
 from arbi_agent.configuration import BrokerType
@@ -421,7 +421,7 @@ def makeSqMat(mat):
 if __name__ == "__main__":
     # Create and start an ARBI Agent
     global arbiAgent
-    broker_url = "tcp://" + str(socket.gethostbyname(socket.gethostname())) + ":61316"
+    broker_url = 'tcp://' + os.environ["JMS_BROKER"]
     arbiAgent = aAgent(agent_name=arbiThis,
                        broker_url=broker_url)
     arbiAgent.execute()
